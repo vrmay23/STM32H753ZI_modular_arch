@@ -10,6 +10,9 @@ NUTTX_HASH="N/A"
 APPS_HASH="N/A"
 COMMIT_MSG=""
 
+# Define the editor to be used. Prioritizes $EDITOR, but uses 'vi' as fallback.
+: ${EDITOR:=vi}
+
 # --- Utility Functions ---
 
 print_header() {
@@ -20,28 +23,49 @@ print_header() {
 }
 
 get_submodule_hashes() {
-    # Captures the short-hashes of the submodules. If fails (e.g., directory doesn't exist), returns 'N/A'.
+    # Captures the short-hashes of the submodules. If fails, returns 'N/A'.
     NUTTX_HASH=$(cd nuttx && git rev-parse --short HEAD 2>/dev/null || echo "N/A")
     APPS_HASH=$(cd apps && git rev-parse --short HEAD 2>/dev/null || echo "N/A")
 }
 
 generate_commit_message() {
-    local USER_MSG=""
-    read -p "Add extra commit message (optional): " USER_MSG
+    local DATE_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    local TEMP_FILE=$(mktemp)
 
-    COMMIT_MSG="Update submodules: nuttx@$NUTTX_HASH apps@$APPS_HASH on $(date '+%Y-%m-%d %H:%M:%S')"
-    if [ -n "$USER_MSG" ]; then
-        COMMIT_MSG="$COMMIT_MSG - $USER_MSG"
-    fi
+    # Initial content for the commit file
+    cat > "$TEMP_FILE" <<- EOM
+Update submodules: nuttx@$NUTTX_HASH apps@$APPS_HASH on $DATE_TIME
+
+# ------------------------
+# Enter your commit message above. Lines starting with '#' will be ignored.
+# The first line is the subject (max 50 chars), separated by a blank line from the body.
+EOM
+
+    # Open the editor (vi/EDITOR) with the temporary file
+    echo "Opening $EDITOR for commit message..."
+    # Loop to ensure the user saves a non-empty message
+    while true; do
+        "$EDITOR" "$TEMP_FILE"
+
+        # Filter out comments and clean up whitespace, keeping only valid message content
+        COMMIT_MSG=$(grep -v '^\s*#' "$TEMP_FILE" | sed '/^\s*$/d')
+
+        if [ -n "$COMMIT_MSG" ]; then
+            break # Exit loop if message is not empty
+        else
+            echo "ERROR: Commit message is empty. Please enter a message or close the editor to abort (Ctrl+C)."
+        fi
+    done
+
+    # Clean up the temporary file
+    rm "$TEMP_FILE"
 }
 
 perform_commit() {
-    echo "Adding all changes..."
-    git add -A || { echo "FATAL: Failed to stage changes."; exit 1; }
-
     if git diff --cached --quiet; then
-        echo "No changes to commit. Working tree is clean."
+        echo "No changes staged. Nothing to commit."
     else
+        # Pass the full message content from the temporary file for the commit
         git commit -m "$COMMIT_MSG" || { echo "FATAL: Failed to commit changes."; exit 1; }
     fi
 }
@@ -90,9 +114,19 @@ main() {
     CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
     get_submodule_hashes
-    generate_commit_message
-    perform_commit
-    pull_and_push
+    
+    # Stage changes first so the user can review them while writing the message
+    echo "Staging all changes before prompting for message..."
+    git add -A || { echo "FATAL: Failed to stage changes."; exit 1; }
+
+    if git diff --cached --quiet; then
+        echo "No changes staged. Nothing to commit."
+    else
+        generate_commit_message
+        perform_commit
+        pull_and_push
+    fi
+
     sync_main
 
     echo
