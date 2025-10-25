@@ -24,9 +24,46 @@ print_header() {
 
 get_submodule_hashes() {
     # Captures the short-hashes of the submodules. If fails, returns 'N/A'.
+    # Uses the last committed hash (or current HEAD if committed locally).
     NUTTX_HASH=$(cd nuttx && git rev-parse --short HEAD 2>/dev/null || echo "N/A")
     APPS_HASH=$(cd apps && git rev-parse --short HEAD 2>/dev/null || echo "N/A")
 }
+
+commit_submodules() {
+    local SUBMODULES="nuttx apps"
+    
+    echo "--- Checking Submodules for Local Changes ---"
+    
+    for MODULE in $SUBMODULES; do
+        if [ -d "$MODULE" ]; then
+            (
+                # Entra no submódulo
+                cd "$MODULE" || { echo "FATAL: Cannot enter $MODULE directory."; exit 1; }
+                
+                # Verifica se há alterações não comitadas ou arquivos não rastreados
+                # ^(M|??)\s detecta arquivos modificados (M) ou não rastreados (??)
+                if git status --porcelain | grep -q '^\(M\|??\)\s'; then
+                    echo "Changes detected in $MODULE. Staging and committing..."
+                    
+                    # 1. Adiciona todos os arquivos modificados/não rastreados
+                    git add -A || { echo "FATAL: Failed to stage changes in $MODULE."; exit 1; }
+                    
+                    # 2. Comita as mudanças, forçando o usuário a fornecer uma mensagem
+                    echo "Please enter a commit message for the $MODULE submodule. (Editor will open)"
+                    git commit -a || { echo "WARN: Commit cancelled or message was empty in $MODULE. Skipping to next submodule."; }
+                    echo "$MODULE commit completed (if message provided)."
+                else
+                    echo "No local changes to commit in $MODULE."
+                fi
+            )
+        else
+            echo "WARN: Submodule directory $MODULE not found. Skipping."
+        fi
+    done
+    
+    echo "--- Submodule check complete ---"
+}
+
 
 generate_commit_message() {
     local DATE_TIME=$(date '+%Y-%m-%d %H:%M:%S')
@@ -41,49 +78,42 @@ Update submodules: nuttx@$NUTTX_HASH apps@$APPS_HASH on $DATE_TIME
 # The first line is the subject (max 50 chars), separated by a blank line from the body.
 EOM
 
-    # Open the editor (vi/EDITOR) with the temporary file
-    echo "Opening $EDITOR for commit message..."
-    # Loop to ensure the user saves a non-empty message
-    while true; do
-        "$EDITOR" "$TEMP_FILE"
+    # Open the editor (vi/nano/etc.)
+    "$EDITOR" "$TEMP_FILE"
 
-        # Filter out comments and clean up whitespace, keeping only valid message content
-        COMMIT_MSG=$(grep -v '^\s*#' "$TEMP_FILE" | sed '/^\s*$/d')
-
-        if [ -n "$COMMIT_MSG" ]; then
-            break # Exit loop if message is not empty
-        else
-            echo "ERROR: Commit message is empty. Please enter a message or close the editor to abort (Ctrl+C)."
-        fi
-    done
-
-    # Clean up the temporary file
+    # Read the final message, ignoring comments
+    COMMIT_MSG=$(grep -v '^\s*#' "$TEMP_FILE" | sed '/^\s*$/d' | tr '\n' '\t' | sed 's/\t$//')
     rm "$TEMP_FILE"
-}
 
-perform_commit() {
-    if git diff --cached --quiet; then
-        echo "No changes staged. Nothing to commit."
-    else
-        # Pass the full message content from the temporary file for the commit
-        git commit -m "$COMMIT_MSG" || { echo "FATAL: Failed to commit changes."; exit 1; }
+    if [ -z "$COMMIT_MSG" ]; then
+        echo "FATAL: Commit message is empty. Aborting commit."
+        exit 1
     fi
 }
 
+perform_commit() {
+    # Commit staged changes using the generated message
+    echo "Performing commit on $CURRENT_BRANCH..."
+    # Replace tabs with newlines for the commit message format
+    COMMIT_MSG_FORMATTED=$(echo "$COMMIT_MSG" | tr '\t' '\n')
+    git commit -m "$COMMIT_MSG_FORMATTED" || { echo "FATAL: Git commit failed."; exit 1; }
+    echo "Commit successful."
+}
+
 pull_and_push() {
-    local REMOTE_BRANCH="origin/$CURRENT_BRANCH"
+    local PUSH_CONFIRM=""
+    read -p "Do you want to PULL (rebase) and then PUSH to origin/$CURRENT_BRANCH? (y/N): " PUSH_CONFIRM
+    
+    if [[ "$PUSH_CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Pulling latest changes with rebase..."
+        # Use pull --rebase to ensure linear history
+        git pull --rebase origin "$CURRENT_BRANCH" || { echo "FATAL: Failed to pull/rebase. Fix conflicts and run the script again."; exit 1; }
 
-    # Checks if the branch exists on the remote
-    if git ls-remote --heads origin "$CURRENT_BRANCH" | grep -q "$CURRENT_BRANCH"; then
-        echo "Pulling latest changes from $REMOTE_BRANCH with rebase (ensuring linear history)..."
-        # Pulls and rebases to maintain linear history
-        git pull --rebase origin "$CURRENT_BRANCH" || { echo "FATAL: Git rebase failed or conflicts on $CURRENT_BRANCH. Fix manually."; exit 1; }
-
-        echo "Pushing current branch..."
-        git push origin "$CURRENT_BRANCH" || { echo "FATAL: Failed to push changes."; exit 1; }
+        echo "Pushing commit to origin/$CURRENT_BRANCH..."
+        git push origin "$CURRENT_BRANCH" || { echo "FATAL: Failed to push to origin/$CURRENT_BRANCH."; exit 1; }
+        echo "Push successful."
     else
-        echo "Branch $CURRENT_BRANCH not found on remote. Performing first push..."
-        git push -u origin "$CURRENT_BRANCH" || { echo "FATAL: Failed initial push."; exit 1; }
+        echo "Commit saved locally. Skipping pull/push."
     fi
 }
 
@@ -113,10 +143,14 @@ main() {
     # Determines the current branch
     CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
+    # 1. Comita todas as alterações DENTRO dos submódulos
+    commit_submodules
+    
+    # 2. Captura os novos hashes (depois do commit)
     get_submodule_hashes
     
-    # Stage changes first so the user can review them while writing the message
-    echo "Staging all changes before prompting for message..."
+    # 3. Faz o stage das alterações no repositório principal (o novo hash do submódulo)
+    echo "Staging all changes (including new submodule hashes)..."
     git add -A || { echo "FATAL: Failed to stage changes."; exit 1; }
 
     if git diff --cached --quiet; then
@@ -126,12 +160,11 @@ main() {
         perform_commit
         pull_and_push
     fi
-
-    sync_main
-
-    echo
-    echo "All operations completed."
+    
+    # sync_main # Função desabilitada por padrão, se for para o MR, ela pode ser dispensada.
+    
+    echo "Script finished."
 }
 
-# Start execution
+# Call main function
 main
